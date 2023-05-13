@@ -58,27 +58,82 @@
           (let [response   (a/<! (aws/invoke-async client (assoc-in list-objects-request [:request :NextContinuationToken] marker)))
                 contents   (:Contents response)
                 new-marker (:NextContinuationToken response)]
-            (doseq [file contents]
-              (a/>! files-channel file))
-            (if new-marker
-              (recur new-marker)
-              (a/close! files-channel))))
+            (if (contains? response :Error)
+              (do
+                (a/>! files-channel (str (Exception. (get-in response [:Error :Code]))))
+                (a/close! files-channel)))
+            (when-not (contains? response :Error)
+                (doseq [file contents]
+                  (a/>! files-channel file))
+                (if new-marker
+                  (recur new-marker)
+                  (a/close! files-channel)))))
         (catch Exception e
-          (a/>! files-channel e))))))
+          (a/close! files-channel)
+          (throw e))))))
 
 
+(comment (defn get-object-pipeline-async [{:keys [client bucket files-channel output-channel pf]}])
+ (a/pipeline-async pf
+                   output-channel
+                   (fn [acc res]
+                     (a/go
+                       (let [content (a/<! (aws/invoke-async
+                                            client {:op      :GetObject
+                                                    :request {:Bucket bucket :Key (acc :Key)}}))]
+                         (a/>! res content)
+                         (a/close! res))))
+                   files-channel))
 
-(defn get-object-pipeline-async [{:keys [client bucket files-channel output-channel pf]}]
-  (a/pipeline-async pf
-                    output-channel
-                    (fn [acc res]
-                      (a/go
-                        (let [content (a/<! (aws/invoke-async
-                                             client {:op      :GetObject
-                                                     :request {:Bucket bucket :Key (acc :Key)}}))]
-                          (a/>! res content)
-                          (a/close! res))))
-                    files-channel))
+
+(defn get-object-pipeline-async [{:keys [client bucket files-channel output-channel error-channel pf]}]
+ (a/pipeline-async
+   pf
+   output-channel
+   (fn [acc res]
+     (a/go
+       (try
+         (let [content (a/<! (aws/invoke-async
+                                client
+                                {:op :GetObject
+                                 :request {:Bucket bucket :Key (acc :Key)}}))]
+           (if (contains? content :Error)
+             (do
+               (a/>! res content)
+               (a/close! res))
+             (a/>! res content)))
+         (catch Exception e
+           (a/>! res e)))
+       (a/close! res)))
+   files-channel))
+
+(defn download-file [client bucket file error-chan]
+  (aws/invoke-async client {:op :GetObject :request {:Bucket bucket :Key file}}))
+
+
+(defn download-files-pipeline-async [{:keys [pf client bucket files-channel output-channel error-channel]}]
+  (let [errors-chan (a/chan)]
+    (a/pipeline-async
+      pf
+      output-channel
+      (fn [acc res]
+        (a/go
+          (try
+            (let [content (a/<! (download-file client bucket (acc :Key) errors-chan))]
+
+              (if (contains? content :Error)
+                (a/put! errors-chan content)
+                (a/>! res content)))
+            (catch Exception e
+              (a/put! errors-chan e)))
+          (a/close! res)
+          (a/close! errors-chan)))
+      files-channel)
+    (a/go
+      (doseq [entry (a/<! errors-chan)]
+        (a/>! error-channel entry))
+      (a/close! error-channel))))
+
 
 (def list-s3-processor  (fn [data]
                           (list-objects-pipeline {:client        (data :s3-client)
