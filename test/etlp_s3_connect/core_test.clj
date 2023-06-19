@@ -69,6 +69,48 @@
        (let [errors# (a/<!! (a/into [] errors-chan#))]
          (is (= errors# ~expected-errors))))))
 
+
+(defmacro def-upload-object-pipeline-test [name config input xf response expected-output]
+  `(clojure.test/deftest ~name
+     (let [client# (cognitect.aws.client.test-double/client {:api :s3
+                                                             :ops {:PutObject (fn [request#]
+                                                                                (if (nil? ~response)
+                                                                                  {:Error {:Code "Network Unreachable"}}
+                                                                                  ~response))}})
+           xform#        ~xf
+
+           results-chan# (a/chan 1 xform#)
+           error-chan# (a/chan)]
+       (upload-objects-pipeline-async (assoc ~config :pf 1 :s3-client client# :files-channel ~input :output-channel results-chan# :error-channel error-chan#))
+       (let [results# (a/<!! (a/into [] (a/merge [results-chan# error-chan#])))]
+         (is (= results# ~expected-output))))))
+
+(def-upload-object-pipeline-test
+  network-unreachable-on-put
+  {:s3-bucket      "test-bucket"
+   :s3-prefix      "foobar"
+   :file-prefix    "msg"
+   :file-extension "hl7"}
+  (a/to-chan [["MSH|some|field|mesg"]])
+  (map identity)
+  nil
+  [[:Error {:Code "Network Unreachable"}]])
+
+
+(def-upload-object-pipeline-test
+  bucket-invalid-on-put
+  {:s3-bucket      "test-bucket"
+   :s3-prefix      "foobar"
+   :file-prefix    "msg"
+   :file-extension "hl7"}
+  (a/to-chan [["MSH|some|field|mesg"]])
+  (map identity)
+  {:Error {:Code "Invalid Bucket"}}
+  [[:Error {:Code "Invalid Bucket"}]])
+
+;; (run-test network-unreachable-on-put)
+;; (run-tests)
+
 (def-download-files-pipeline-async-test
   alt-download-multiple-files
   {:bucket "test-bucket"}
@@ -82,8 +124,6 @@
   {:Body (io/input-stream (.getBytes "1,2,3,4\n2,3,4\n5,6,7"))}
   [1 2 3 4 2 3 4 5 6 7 1 2 3 4 2 3 4 5 6 7]
   [])
-
-;(run-test alt-download-multiple-files)
 
 (def-download-files-pipeline-async-test
   alt-download-multiple-files-nil
@@ -99,8 +139,6 @@
   []
   [[:Error {:Code "NoSuchKey" :Message "The specified key does not exist"}]])
 
-;(run-test alt-download-multiple-files-nil)
-
 (def-get-object-pipeline-test
  download-empty-input
  {:bucket "test-bucket"}
@@ -112,7 +150,6 @@
     (map (fn [d] (Integer/parseInt d))))
  nil
  [])
-
 
 (def-get-object-pipeline-test
  download-multiple-files

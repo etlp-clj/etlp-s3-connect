@@ -5,8 +5,9 @@
             [cognitect.aws.client.api :as aws]
             [cognitect.aws.credentials :as credentials]
             [clojure.pprint :refer [pprint]]
+            [clojure.string :as s]
             [etlp.connector.dag :as dag]
-            [etlp.connector.protocols :refer [EtlpSource]]
+            [etlp.connector.protocols :refer [EtlpSource EtlpDestination]]
             [etlp.utils.reducers :refer [lines-reducible]]
             [etlp.utils.core :refer [wrap-error wrap-log wrap-record]])
   (:import [java.io BufferedReader InputStreamReader]
@@ -35,6 +36,8 @@
        (catch Exception ex
          (debug ex)
          (throw ex))))
+
+(defn uuid [] (.toString (java.util.UUID/randomUUID)))
 
 (comment (defn list-objects-pipeline [{:keys [client bucket prefix files-channel]}]
           (let [list-objects-request {:op :ListObjectsV2 :request {:Bucket bucket :Prefix prefix}}]
@@ -135,6 +138,41 @@
       (a/close! error-channel))))
 
 
+(def build-file-path (fn [{:keys [s3-prefix file-prefix file-extension ]}]
+  (str s3-prefix "/" file-prefix "-" (uuid) "." file-extension)))
+
+(def upload-batch-s3 (fn [{:keys [s3-client s3-bucket s3-prefix file-prefix file-extension] :as config} msg]
+                        (aws/invoke-async s3-client {:op :PutObject :request {:Bucket s3-bucket
+                                                                           :Key (build-file-path
+                                                                                 (select-keys config [:s3-bucket :s3-prefix :file-prefix :file-extension]))
+                                                                    :Body   (.getBytes (s/join "\n" msg))}})))
+
+
+(defn upload-objects-pipeline-async [{:keys [pf s3-client s3-bucket files-channel output-channel error-channel] :as config}]
+  (let [errors-chan (a/chan)]
+    (a/pipeline-async
+      pf
+      output-channel
+      (fn [acc res]
+        (a/go
+          (try
+            (let [content (a/<! (upload-batch-s3 (select-keys config [:s3-bucket :s3-client :s3-prefix :file-prefix :file-extension]) acc))]
+
+              (if (contains? content :Error)
+                (a/put! errors-chan content)
+                (a/>! res content)))
+            (catch Exception e
+              (a/put! errors-chan e)))
+          (a/close! res)
+          (a/close! errors-chan)))
+      files-channel)
+    (a/go
+      (doseq [entry (a/<! errors-chan)]
+        (a/>! error-channel entry))
+      (a/close! error-channel))))
+
+
+
 (def list-s3-processor  (fn [data]
                           (list-objects-pipeline {:client        (data :s3-client)
                                                   :bucket        (data :bucket)
@@ -151,10 +189,40 @@
                                                     :output-channel output})
                         output)))
 
-(def etlp-processor (fn [ch]
-                      (if (instance? ManyToManyChannel ch)
-                        ch
-                        (ch :channel))))
+(def upload-s3-objects (fn [data]
+                         (let [output (data :output-channel)]
+                           (upload-objects-pipeline-async {:s3-client      (data :s3-client)
+                                                           :s3-bucket      (data :s3-bucket)
+                                                           :s3-prefix      (data :s3-prefix)
+                                                           :files-channel  (data :channel)
+                                                           :file-prefix    (data :file-prefix)
+                                                           :file-extension (data :file-extension)
+                                                           :pf             (data :threads)
+                                                           :output-channel output})
+                        output)))
+
+(def etlp-processor (fn [data]
+                      (if (instance? ManyToManyChannel data)
+                        data
+                        (data :channel))))
+
+(defn s3-upload-topology [{:keys [s3-config prefix bucket processors reducers reducer threads partitions file-prefix file-extension]}]
+  (let [s3-client (s3-invoke s3-config)
+        entities  {:etlp-input {:channel (a/chan (a/buffer partitions))
+                                :meta    {:entity-type :processor
+                                          :processor   (processors :etlp-processor)}}
+
+                   :etlp-output {:s3-client      s3-client
+                                 :s3-bucket      bucket
+                                 :s3-prefix      prefix
+                                 :output-channel (a/chan (a/buffer partitions))
+                                 :meta           {:entity-type :processor
+                                                  :processor   (processors :upload-s3-processor)}}}
+        workflow [[:etlp-input :etlp-output]]]
+
+    {:entities entities
+     :workflow workflow}))
+
 
 (defn s3-process-topology [{:keys [s3-config prefix bucket processors reducers reducer threads partitions]}]
   (let [s3-client   (s3-invoke s3-config)
@@ -272,4 +340,24 @@
                                                                      :reducers         reducers
                                                                      :reducer          reducer
                                                                      :topology-builder s3-list-topology})]
+                               s3-connector)))
+
+(defrecord S3Destination [s3-config bucket prefix reducers reducer threads partitions topology-builder]
+  EtlpDestination
+  (write! [this]
+    (let [topology (topology-builder this)
+          workflow (dag/build topology)]
+      workflow)))
+
+(def create-s3-destination! (fn [{:keys [s3-config bucket prefix reducers reducer threads partitions] :as opts}]
+                              (let [s3-connector (map->S3Destination {:s3-config        s3-config
+                                                                      :prefix           prefix
+                                                                      :bucket           bucket
+                                                                      :threads          threads
+                                                                      :partitions       partitions
+                                                                      :processors       {:upload-s3-processor upload-s3-objects
+                                                                                         :etlp-processor    etlp-processor}
+                                                                      :reducers         reducers
+                                                                      :reducer          reducer
+                                                                      :topology-builder s3-upload-topology})]
                                s3-connector)))
