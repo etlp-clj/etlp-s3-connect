@@ -27,14 +27,14 @@
            BufferedReader.
            lines-reducible))
       (catch Exception e
-        (println (str "Error Processing" e))
+        (warn (str "Error Processing:: " e))
         (throw e)))))
 
 (defn s3-invoke [{:keys [region credentials] :as s3conf}]
   ; assert for aws keys validation
   (try (aws/client {:api :s3 :region region :credentials-provider (credentials/basic-credentials-provider credentials)})
        (catch Exception ex
-         (debug ex)
+         (warn ex)
          (throw ex))))
 
 (defn uuid [] (.toString (java.util.UUID/randomUUID)))
@@ -142,10 +142,10 @@
   (str s3-prefix "/" file-prefix "-" (uuid) "." file-extension)))
 
 (def upload-batch-s3 (fn [{:keys [s3-client s3-bucket s3-prefix file-prefix file-extension] :as config} msg]
-                        (aws/invoke-async s3-client {:op :PutObject :request {:Bucket s3-bucket
-                                                                           :Key (build-file-path
-                                                                                 (select-keys config [:s3-bucket :s3-prefix :file-prefix :file-extension]))
-                                                                    :Body   (.getBytes (s/join "\n" msg))}})))
+                       (aws/invoke-async s3-client {:op :PutObject :request {:Bucket s3-bucket
+                                                                             :Key    (build-file-path
+                                                                                   (select-keys config [:s3-bucket :s3-prefix :file-prefix :file-extension]))
+                                                                             :Body   (.getBytes (s/join "\n" msg))}})))
 
 
 (defn upload-objects-pipeline-async [{:keys [pf s3-client s3-bucket files-channel output-channel error-channel] :as config}]
@@ -156,18 +156,23 @@
       (fn [acc res]
         (a/go
           (try
+            (info "Uploading Batch of size" (count acc))
             (let [content (a/<! (upload-batch-s3 (select-keys config [:s3-bucket :s3-client :s3-prefix :file-prefix :file-extension]) acc))]
 
               (if (contains? content :Error)
-                (a/put! errors-chan content)
+                (do
+                  (info content)
+                  (a/put! errors-chan content))
                 (a/>! res content)))
             (catch Exception e
+              (warn e)
               (a/put! errors-chan e)))
           (a/close! res)
           (a/close! errors-chan)))
       files-channel)
     (a/go
       (doseq [entry (a/<! errors-chan)]
+        (warn entry)
         (a/>! error-channel entry))
       (a/close! error-channel))))
 
@@ -181,16 +186,18 @@
                           (data :channel)))
 
 (def get-s3-objects (fn [data]
+                      ;; (println "Xform>>>" data)
                       (let [output (data :output-channel)]
                         (get-object-pipeline-async {:client         (data :s3-client)
                                                     :bucket         (data :bucket)
                                                     :files-channel  (data :channel)
                                                     :pf             (data :threads)
+                                                    :error-channel  (a/chan 1)
                                                     :output-channel output})
                         output)))
 
 (def upload-s3-objects (fn [data]
-                         (let [output (data :output-channel)]
+                         (let [output (data :output-channel) errors-chan (data :error-channel)]
                            (upload-objects-pipeline-async {:s3-client      (data :s3-client)
                                                            :s3-bucket      (data :s3-bucket)
                                                            :s3-prefix      (data :s3-prefix)
@@ -198,6 +205,7 @@
                                                            :file-prefix    (data :file-prefix)
                                                            :file-extension (data :file-extension)
                                                            :pf             (data :threads)
+                                                           :error-channel  errors-chan
                                                            :output-channel output})
                         output)))
 
@@ -206,18 +214,23 @@
                         data
                         (data :channel))))
 
-(defn s3-upload-topology [{:keys [s3-config prefix bucket processors reducers reducer threads partitions file-prefix file-extension]}]
+(defn s3-upload-topology [{:keys [s3-config prefix bucket processors threads partitions file-prefix file-extension] :as conf}]
+  ;; (println ">>>DEbug>>" file-extension)
   (let [s3-client (s3-invoke s3-config)
-        entities  {:etlp-input {:channel (a/chan (a/buffer partitions))
-                                :meta    {:entity-type :processor
-                                          :processor   (processors :etlp-processor)}}
+        entities  {:etlp-input {:channel        (a/chan (a/buffer partitions))
+                                :s3-client      s3-client
+                                :s3-bucket      bucket
+                                :s3-prefix      prefix
+                                :file-prefix    file-prefix
+                                :file-extension file-extension
+                                :threads        threads
+                                :output-channel (a/chan (a/buffer partitions))
+                                :error-channel  (a/chan (a/buffer partitions))
+                                :meta           {:entity-type :processor
+                                                 :processor   (processors :upload-s3-processor)}}
 
-                   :etlp-output {:s3-client      s3-client
-                                 :s3-bucket      bucket
-                                 :s3-prefix      prefix
-                                 :output-channel (a/chan (a/buffer partitions))
-                                 :meta           {:entity-type :processor
-                                                  :processor   (processors :upload-s3-processor)}}}
+                   :etlp-output {:meta {:entity-type :processor
+                                        :processor   (processors :etlp-processor)}}}
         workflow [[:etlp-input :etlp-output]]]
 
     {:entities entities
@@ -238,8 +251,10 @@
                      :get-s3-objects {:s3-client      s3-client
                                       :bucket         bucket
                                       :threads        threads
+                                      :channel        (a/chan (a/buffer partitions))
                                       :output-channel (a/chan (a/buffer partitions))
                                       :meta           {:entity-type :processor
+                                                       :threads     threads
                                                        :processor   (processors :get-s3-objects)}}
 
                      :reduce-s3-objects {:meta {:entity-type :xform-provider
@@ -247,12 +262,11 @@
                                                 :partitions  partitions
                                                 :xform       s3-reducer}}
 
-                     :etlp-output {:channel (a/chan (a/buffer partitions))
-                                   :meta    {:entity-type :processor
-                                             :processor   (processors :etlp-processor)}}}
+                     :etlp-output {:meta {:entity-type :processor
+                                          :processor   (processors :etlp-processor)}}}
         workflow [[:etlp-input :get-s3-objects]
-                  [:get-s3-objects :reduce-s3-objects]
-                  [:reduce-s3-objects :etlp-output]]]
+                  ;; [:get-s3-objects :reduce-s3-objects]
+                  [:get-s3-objects :etlp-output]]]
 
     {:entities entities
      :workflow workflow}))
@@ -342,22 +356,22 @@
                                                                      :topology-builder s3-list-topology})]
                                s3-connector)))
 
-(defrecord S3Destination [s3-config bucket prefix reducers reducer threads partitions topology-builder]
+(defrecord S3Destination [s3-config bucket prefix file-extension file-prefix processors threads partitions topology-builder]
   EtlpDestination
   (write! [this]
     (let [topology (topology-builder this)
           workflow (dag/build topology)]
       workflow)))
 
-(def create-s3-destination! (fn [{:keys [s3-config bucket prefix reducers reducer threads partitions] :as opts}]
+(def create-s3-destination! (fn [{:keys [s3-config bucket prefix file-prefix file-extension threads partitions] :as opts}]
                               (let [s3-connector (map->S3Destination {:s3-config        s3-config
                                                                       :prefix           prefix
                                                                       :bucket           bucket
                                                                       :threads          threads
                                                                       :partitions       partitions
                                                                       :processors       {:upload-s3-processor upload-s3-objects
-                                                                                         :etlp-processor    etlp-processor}
-                                                                      :reducers         reducers
-                                                                      :reducer          reducer
+                                                                                         :etlp-processor      etlp-processor}
+                                                                      :file-prefix      file-prefix
+                                                                      :file-extension   file-extension
                                                                       :topology-builder s3-upload-topology})]
                                s3-connector)))
