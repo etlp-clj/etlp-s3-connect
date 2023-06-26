@@ -32,25 +32,14 @@
 
 (defn s3-invoke [{:keys [region credentials] :as s3conf}]
   ; assert for aws keys validation
-  (try (aws/client {:api :s3 :region region :credentials-provider (credentials/basic-credentials-provider credentials)})
+  (try (aws/client {:api :s3
+                    :region region
+                    :credentials-provider (credentials/basic-credentials-provider credentials)})
        (catch Exception ex
          (warn ex)
          (throw ex))))
 
 (defn uuid [] (.toString (java.util.UUID/randomUUID)))
-
-(comment (defn list-objects-pipeline [{:keys [client bucket prefix files-channel]}]
-          (let [list-objects-request {:op :ListObjectsV2 :request {:Bucket bucket :Prefix prefix}}]
-            (a/go (loop [marker nil]
-                    (let [response   (a/<! (aws/invoke-async client (assoc-in list-objects-request [:request :NextContinuationToken] marker)))
-                          contents   (:Contents response)
-                          new-marker (:NextContinuationToken response)]
-                      (doseq [file contents]
-                        (a/>! files-channel file))
-                      (if new-marker
-                        (recur new-marker)
-                        (a/close! files-channel))))
-                  files-channel))))
 
 
 (defn list-objects-pipeline [{:keys [client bucket prefix files-channel]}]
@@ -58,7 +47,10 @@
     (a/go
       (try
         (loop [marker nil]
-          (let [response   (a/<! (aws/invoke-async client (assoc-in list-objects-request [:request :NextContinuationToken] marker)))
+          (let [response   (a/<!
+                            (aws/invoke-async client
+                                              (assoc-in
+                                               list-objects-request [:request :NextContinuationToken] marker)))
                 contents   (:Contents response)
                 new-marker (:NextContinuationToken response)]
             (if (contains? response :Error)
@@ -66,7 +58,7 @@
                 (a/>! files-channel (str (Exception. (get-in response [:Error :Code]))))
                 (a/close! files-channel)))
             (when-not (contains? response :Error)
-                (doseq [file contents]
+              (doseq [file contents]
                   (a/>! files-channel file))
                 (if new-marker
                   (recur new-marker)
@@ -74,19 +66,6 @@
         (catch Exception e
           (a/close! files-channel)
           (throw e))))))
-
-
-(comment (defn get-object-pipeline-async [{:keys [client bucket files-channel output-channel pf]}])
- (a/pipeline-async pf
-                   output-channel
-                   (fn [acc res]
-                     (a/go
-                       (let [content (a/<! (aws/invoke-async
-                                            client {:op      :GetObject
-                                                    :request {:Bucket bucket :Key (acc :Key)}}))]
-                         (a/>! res content)
-                         (a/close! res))))
-                   files-channel))
 
 
 (defn get-object-pipeline-async [{:keys [client bucket files-channel output-channel error-channel pf]}]
@@ -142,10 +121,14 @@
   (str s3-prefix "/" file-prefix "-" (uuid) "." file-extension)))
 
 (def upload-batch-s3 (fn [{:keys [s3-client s3-bucket s3-prefix file-prefix file-extension] :as config} msg]
-                       (aws/invoke-async s3-client {:op :PutObject :request {:Bucket s3-bucket
-                                                                             :Key    (build-file-path
-                                                                                   (select-keys config [:s3-bucket :s3-prefix :file-prefix :file-extension]))
-                                                                             :Body   (.getBytes (s/join "\n" msg))}})))
+                       (aws/invoke-async s3-client {:op      :PutObject
+                                                    :request {:Bucket s3-bucket
+                                                              :Key    (build-file-path
+                                                                       (select-keys config [:s3-bucket
+                                                                                            :s3-prefix
+                                                                                            :file-prefix
+                                                                                            :file-extension]))
+                                                              :Body   (.getBytes (s/join "\n" msg))}})))
 
 
 (defn upload-objects-pipeline-async [{:keys [pf s3-client s3-bucket files-channel output-channel error-channel] :as config}]
@@ -157,7 +140,11 @@
         (a/go
           (try
             (info "Uploading Batch of size" (count acc))
-            (let [content (a/<! (upload-batch-s3 (select-keys config [:s3-bucket :s3-client :s3-prefix :file-prefix :file-extension]) acc))]
+            (let [content (a/<! (upload-batch-s3 (select-keys config [:s3-bucket
+                                                                      :s3-client
+                                                                      :s3-prefix
+                                                                      :file-prefix
+                                                                      :file-extension]) acc))]
 
               (if (contains? content :Error)
                 (do
