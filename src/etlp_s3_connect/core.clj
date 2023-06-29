@@ -14,13 +14,13 @@
            [clojure.core.async.impl.channels ManyToManyChannel])
   (:gen-class))
 
-(defn s3-reducible [xf blob]
+(defn s3-reducible [xf-provider blob]
   ;; (print "Should be blob" blob)
   (if (instance? ManyToManyChannel blob)
     (throw (Exception. "Invalid Blob"))
     (try
       (eduction
-       xf
+       (xf-provider blob)
        (-> blob
            :Body
            InputStreamReader.
@@ -60,9 +60,9 @@
             (when-not (contains? response :Error)
               (doseq [file contents]
                   (a/>! files-channel file))
-                (if new-marker
-                  (recur new-marker)
-                  (a/close! files-channel)))))
+              (if new-marker
+                (recur new-marker)
+                (a/close! files-channel)))))
         (catch Exception e
           (a/close! files-channel)
           (throw e))))))
@@ -83,7 +83,7 @@
              (do
                (a/>! res content)
                (a/close! res))
-             (a/>! res content)))
+             (a/>! res (assoc content :Key (acc :Key) :Bucket bucket))))
          (catch Exception e
            (a/>! res e)))
        (a/close! res)))
@@ -117,8 +117,8 @@
       (a/close! error-channel))))
 
 
-(def build-file-path (fn [{:keys [s3-prefix file-prefix file-extension ]}]
-  (str s3-prefix "/" file-prefix "-" (uuid) "." file-extension)))
+(def build-file-path (fn [{:keys [s3-prefix file-prefix file-extension]}]
+                      (str s3-prefix "/" file-prefix "-" (uuid) "." file-extension)))
 
 (def upload-batch-s3 (fn [{:keys [s3-client s3-bucket s3-prefix file-prefix file-extension] :as config} msg]
                        (aws/invoke-async s3-client {:op      :PutObject
@@ -194,7 +194,7 @@
                                                            :pf             (data :threads)
                                                            :error-channel  errors-chan
                                                            :output-channel output})
-                        output)))
+                          output)))
 
 (def etlp-processor (fn [data]
                       (if (instance? ManyToManyChannel data)
@@ -226,8 +226,6 @@
 
 (defn s3-process-topology [{:keys [s3-config prefix bucket processors reducers reducer threads partitions]}]
   (let [s3-client   (s3-invoke s3-config)
-        reducing-fn (reducers reducer)
-        s3-reducer  (comp (mapcat (partial s3-reducible reducing-fn)))
         entities    {:etlp-input {:s3-client s3-client
                                   :bucket    bucket
                                   :prefix    prefix
@@ -244,15 +242,9 @@
                                                        :threads     threads
                                                        :processor   (processors :get-s3-objects)}}
 
-                     :reduce-s3-objects {:meta {:entity-type :xform-provider
-                                                :threads     threads
-                                                :partitions  partitions
-                                                :xform       s3-reducer}}
-
                      :etlp-output {:meta {:entity-type :processor
                                           :processor   (processors :etlp-processor)}}}
         workflow [[:etlp-input :get-s3-objects]
-                  ;; [:get-s3-objects :reduce-s3-objects]
                   [:get-s3-objects :etlp-output]]]
 
     {:entities entities

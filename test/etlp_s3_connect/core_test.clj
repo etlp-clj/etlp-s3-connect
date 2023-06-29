@@ -40,7 +40,7 @@
                                                                                 (if (nil? ~response)
                                                                                   {:Error {:Code "File Not Found"}}
                                                                                   (merge request# ~response)))}})
-           xform#        ~xf
+           xform#        (fn [data#] ~xf)
            s3-reducer#   (comp
                           (filter #(contains? % :Body))
                           (mapcat (partial etlp-s3-connect.core/s3-reducible xform#)))
@@ -58,7 +58,7 @@
                                                                                        {:Error {:Code "NoSuchKey" :Message "The specified key does not exist"}}
                                                                                        (merge request# ~response)))}})
            errors-chan# (a/chan)
-           xform#       ~xf
+           xform#       (fn [data#] ~xf)
            s3-reducer#  (comp
                          (filter #(contains? % :Body))
                          (mapcat (partial etlp-s3-connect.core/s3-reducible xform#)))
@@ -188,17 +188,23 @@
  [])
 
 (def-s3-reducible-test s3-reducible-test-1 "1\n2\n3\n" [2 3 4]
-  (comp
-   (map (fn [d] (Integer/parseInt d)))
-   (filter numeric-line?)
-   (map inc)))
+  (fn [blob]
+    (comp
+     (map (fn [d] (Integer/parseInt d)))
+     (filter numeric-line?)
+     (map inc))))
+
+;(run-test s3-reducible-test-1)
 
 (def-s3-reducible-test s3-reducible-test-2 "1\n2\n3\n" [3 4 5]
-  (comp
-    (map (fn [d] (Integer/parseInt d)))
-    (filter numeric-line?)
-    (map inc)
-    (map inc)))
+  (fn [blob]
+    (comp
+     (map (fn [d] (Integer/parseInt d)))
+     (filter numeric-line?)
+     (map inc)
+     (map inc))))
+
+;(run-test s3-reducible-test-2)
 
 (def-list-s3-objects-test
  test-single-file
