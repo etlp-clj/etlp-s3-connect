@@ -10,4 +10,5 @@
                  [org.clojure/tools.logging "1.2.4"]
                  [org.clojure/core.async "0.4.500"]
                  [org.clojars.aregee/etlp "0.3.2-SNAPSHOT"]]
+  :deploy-repositories {"releases" {:url "https://repo.clojars.org" :creds :gpg}}
   :repl-options {:init-ns etlp-s3-connect.core})
