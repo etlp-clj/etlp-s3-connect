@@ -6,6 +6,19 @@ A Clojure library designed to ... well, that part is up to you.
 
 FIXME
 
+
+## TODO
+
+
+
+
+- SQS Source 
+  Should take an SQS Queue url and start listening to the given Queue
+  
+- SQS Destination 
+  Should take SQS Queue attributes, and create SQS queue, if not exist and moves the data to SQS. 
+
+
 ## License
 
 Copyright © 2023 FIXME

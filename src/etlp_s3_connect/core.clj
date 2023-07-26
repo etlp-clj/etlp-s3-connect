@@ -30,6 +30,31 @@
         (warn (str "Error Processing:: " e))
         (throw e)))))
 
+(defn aws-client-invoke [{:keys [region credentials api] :as conf}]
+  ; assert for aws keys validation
+  (try (aws/client {:api api
+                    :region region
+                    :credentials-provider (credentials/basic-credentials-provider credentials)})
+       (catch Exception ex
+         (warn ex)
+         (throw ex))))
+
+(defprotocol ReadQueueResource
+  (execute [this])
+  (maxNumberOfMessages [this])
+  (pollInterval [this]))
+
+(defprotocol WriteQueueResource
+  (execute [this message]))
+
+
+
+(def sqs (aws/client {:api :sqs}))
+
+(aws/invoke sqs {:op :CreateQueue
+                 :request {:QueueName "test-queue.fifo"
+                           :Attributes {"FifoQueue" "true"}}})
+
 (defn s3-invoke [{:keys [region credentials] :as s3conf}]
   ; assert for aws keys validation
   (try (aws/client {:api :s3
@@ -40,6 +65,90 @@
          (throw ex))))
 
 (defn uuid [] (.toString (java.util.UUID/randomUUID)))
+
+(defn listen-sqs-topic-pipeline [{:keys [client queue-url files-channel]}]
+  (let [list-objects-request {:op :ReceiveMessage :request {:QueueUrl queue-url}}]
+    (a/go
+      (try
+       (let [response   (a/<!
+                            (aws/invoke-async client list-objects-request))
+                contents   (:Messages response)]
+            (if (contains? response :Error)
+              (do
+                (a/>! files-channel (str (Exception. (get-in response [:Error :Code]))))
+                (a/close! files-channel)))
+            (when-not (contains? response :Error)
+              (doseq [file contents]
+                  (a/>! files-channel file))))
+        (catch Exception e
+          (a/close! files-channel)
+          (throw e))))))
+
+;(def queue-url "https://sqs.us-east-1.amazonaws.com/670868576168/test-queue.fifo")
+
+;(aws/invoke sqs {:op :SendMessage :request {:QueueUrl queue-url :MessageBody "foobar" :MessageGroupId (uuid)
+;                                            :MessageDeduplicationId (uuid)}})
+;; (aws/invoke sqs {:op :GetQueueUrl :request {:QueueName "test-queue.fifo"}})
+
+(defrecord PublishSQSResource [client queue-name]
+  WriteQueueResource
+  (execute [this message]
+    (let [queue-url  (-> (aws/invoke client {:op :GetQueueUrl :request {:QueueName queue-name}})
+                        :QueueUrl)
+          files-list (a/chan)]
+      (aws/invoke-async client {:op :SendMessage :ch files-list :request {:QueueUrl               queue-url
+                                                                          :MessageBody            message
+                                                                          :MessageGroupId         (uuid)
+                                                                          :MessageDeduplicationId (uuid)}})
+      (a/<!! files-list))))
+
+(defrecord SubscribeSQSResource [client queue-name queue-config poll-interval]
+  ReadQueueResource
+  (execute [this]
+    (let [queue-url (aws/invoke client {:op :GetQueueUrl :request {:QueueName queue-name}})
+          files-list (a/chan)]
+      (listen-sqs-topic-pipeline {:client client :queue-url (:QueueUrl queue-url) :files-channel files-list})
+      (a/<!! files-list)))
+  (pollInterval [this]
+    (:poll-interval this)))
+
+
+(def sqs-write (->PublishSQSResource sqs "test-queue.fifo"))
+
+;(.execute sqs-write "new-file-order.hl7")
+
+;(def sqs-q (->SubscribeSQSResource sqs "test-queue.fifo" {} 100))
+
+;(.pollInterval sqs-q)
+
+(defn start [resource]
+  (let [result-chan (a/chan)]
+    (a/go-loop []
+      (let [page (.execute resource)]
+        (a/>! result-chan page)
+        (when (nil? page)
+            (Thread/sleep (.pollInterval resource))
+            (recur))))
+    result-chan))
+
+(def create-sqs-processor! (fn [opts]
+                              (map->SubscribeSQSResource opts)))
+
+(defn list-sqs-processor [{:keys [sqs-config]}]
+  (let [sqs-reader (create-sqs-processor! sqs-config)
+        results (start sqs-reader)]
+    results))
+
+(def results (list-sqs-processor {:sqs-config {:client        sqs
+                                 :queue-name    "test-queue.fifo"
+                                 :queue-config  {}
+                                 :poll-interval 500}}))
+
+(a/go-loop []
+  (let [res (a/<! results)]
+    (if (not (nil? res))
+      (println :Consume res)
+      (recur))))
 
 
 (defn list-objects-pipeline [{:keys [client bucket prefix files-channel]}]

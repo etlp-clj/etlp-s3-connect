@@ -6,6 +6,7 @@
   :dependencies [[org.clojure/clojure "1.11.1"]
                  [com.cognitect.aws/endpoints "1.1.12.380"]
                  [com.cognitect.aws/s3 "825.2.1250.0"]
+                 [com.cognitect.aws/sqs "822.2.1109.0"]
                  [com.cognitect.aws/api "0.8.635"]
                  [org.clojure/tools.logging "1.2.4"]
                  [org.clojure/core.async "0.4.500"]
